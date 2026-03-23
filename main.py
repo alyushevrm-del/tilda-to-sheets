@@ -29,8 +29,9 @@ def col_letter_to_index(col: str) -> int:
 
 
 def get_sheet(sheet_name: str):
-    creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-    creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    creds = Credentials.from_service_account_file(
+        "/etc/secrets/credentials.json", scopes=SCOPES
+    )
     client = gspread.authorize(creds)
     spreadsheet = client.open_by_key(SPREADSHEET_ID)
     try:
