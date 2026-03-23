@@ -33,11 +33,22 @@ def get_sheet(sheet_name: str):
         "/etc/secrets/credentials.json", scopes=SCOPES
     )
     client = gspread.authorize(creds)
-    spreadsheet = client.open_by_key(SPREADSHEET_ID)
+    try:
+        spreadsheet = client.open_by_key(SPREADSHEET_ID)
+    except Exception as e:
+        import requests as req
+        # Проверяем напрямую
+        token = creds.token
+        r = req.get(
+            f"https://sheets.googleapis.com/v4/spreadsheets/{SPREADSHEET_ID}",
+            headers={"Authorization": f"Bearer {token}"}
+        )
+        logger.error(f"Прямой запрос: status={r.status_code}, body={r.text[:500]}")
+        raise
     try:
         sheet = spreadsheet.worksheet(sheet_name)
     except gspread.WorksheetNotFound:
-        raise ValueError(f"Лист '{sheet_name}' не найден в таблице.")
+        raise ValueError(f"Лист '{sheet_name}' не найден.")
     return sheet
 
 
