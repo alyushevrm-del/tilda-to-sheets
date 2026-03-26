@@ -17,16 +17,13 @@ SCOPES = [
 ]
 
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
-
 FIRST_DATA_ROW = 5
-
 app = FastAPI(title="Tilda to Google Sheets webhook")
-
 
 def get_worksheet(turnir: str) -> gspread.Worksheet:
     creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
     if creds_json:
-        info = json.loads(creds_json)
+        info = json.loads(creds_json, strict=False)
         creds = Credentials.from_service_account_info(info, scopes=SCOPES)
     else:
         creds = Credentials.from_service_account_file(
@@ -36,14 +33,12 @@ def get_worksheet(turnir: str) -> gspread.Worksheet:
     spreadsheet = client.open_by_key(SPREADSHEET_ID)
     return spreadsheet.worksheet(turnir)
 
-
 def find_first_empty_row(ws: gspread.Worksheet) -> int:
     col_a = ws.col_values(1)
     for row_idx in range(FIRST_DATA_ROW, len(col_a) + 1):
         if row_idx > len(col_a) or col_a[row_idx - 1] == "":
             return row_idx
     return len(col_a) + 1
-
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -54,15 +49,11 @@ async def webhook(request: Request):
         else:
             form = await request.form()
             data = dict(form)
-
         logger.info("Received data: %s", data)
-
         turnir = (data.get("turnir") or "").strip()
-
         if not turnir:
             logger.info("Empty turnir - ignoring test request")
             return JSONResponse({"status": "ok", "ignored": True})
-
         name           = (data.get("name")            or "").strip()
         phone          = (data.get("phone")           or "").strip()
         email          = (data.get("email")           or "").strip()
@@ -77,17 +68,13 @@ async def webhook(request: Request):
         kol_trener     = (data.get("kol_trener")      or "").strip()
         kol_parent     = (data.get("kol_parent")      or "").strip()
         transfer       = (data.get("transfer")        or "").strip()
-
         team_contact  = f"{name_team}, {name}" if name_team and name else (name_team or name)
         arrival_dt    = f"{date_start} {time_start}".strip()
         departure_dt  = f"{date_end} {time_end}".strip()
-
         ws = get_worksheet(turnir)
         row = find_first_empty_row(ws)
         serial = row - FIRST_DATA_ROW + 1
-
         logger.info("Writing to sheet '%s', row %d", turnir, row)
-
         updates = [
             {"range": f"A{row}",  "values": [[serial]]},
             {"range": f"B{row}",  "values": [[team_contact]]},
@@ -104,20 +91,15 @@ async def webhook(request: Request):
             {"range": f"BW{row}", "values": [[phone]]},
             {"range": f"BX{row}", "values": [[email]]},
         ]
-
         ws.batch_update(updates, value_input_option="USER_ENTERED")
-
         logger.info("Successfully written row %d to sheet '%s'", row, turnir)
         return JSONResponse({"status": "ok", "sheet": turnir, "row": row})
-
     except gspread.exceptions.WorksheetNotFound:
         logger.error("Worksheet '%s' not found", turnir)
         return JSONResponse({"status": "error", "detail": f"Worksheet '{turnir}' not found"})
-
     except Exception as exc:
         logger.exception("Unexpected error: %s", exc)
         return JSONResponse({"status": "error", "detail": str(exc)})
-
 
 @app.get("/")
 def healthcheck():
