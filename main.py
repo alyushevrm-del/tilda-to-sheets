@@ -1,104 +1,52 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-import gspread
-from google.oauth2.service_account import Credentials
 import os
 import json
 import logging
 
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+import gspread
+from google.oauth2.service_account import Credentials
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-app = FastAPI()
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 
-SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID")
-GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
+
+FIRST_DATA_ROW = 5
+
+app = FastAPI(title="Tilda to Google Sheets webhook")
 
 
-def col_letter_to_index(col: str) -> int:
-    col = col.upper()
-    result = 0
-    for char in col:
-        result = result * 26 + (ord(char) - ord('A') + 1)
-    return result
-
-
-def get_sheet(sheet_name: str):
-    creds = Credentials.from_service_account_file(
-        "/etc/secrets/credentials.json", scopes=SCOPES
-    )
-    client = gspread.authorize(creds)
-    try:
-        spreadsheet = client.open_by_key(SPREADSHEET_ID)
-    except Exception as e:
-        import requests as req
-        # Проверяем напрямую
-        token = creds.token
-        r = req.get(
-            f"https://sheets.googleapis.com/v4/spreadsheets/{SPREADSHEET_ID}",
-            headers={"Authorization": f"Bearer {token}"}
+def get_worksheet(turnir: str) -> gspread.Worksheet:
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    if creds_json:
+        info = json.loads(creds_json)
+        creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+    else:
+        creds = Credentials.from_service_account_file(
+            "/etc/secrets/credentials.json", scopes=SCOPES
         )
-        logger.error(f"Прямой запрос: status={r.status_code}, body={r.text[:500]}")
-        raise
-    try:
-        sheet = spreadsheet.worksheet(sheet_name)
-    except gspread.WorksheetNotFound:
-        raise ValueError(f"Лист '{sheet_name}' не найден.")
-    return sheet
+    client = gspread.authorize(creds)
+    spreadsheet = client.open_by_key(SPREADSHEET_ID)
+    return spreadsheet.worksheet(turnir)
 
 
-def find_next_empty_row(sheet) -> int:
-    col_a = sheet.col_values(1)
-    for i in range(4, len(col_a)):
-        if not str(col_a[i]).strip():
-            return i + 1
-    return max(len(col_a) + 1, 5)
-
-
-def parse_tilda_data(data: dict) -> dict:
-    return {k.lower().strip(): str(v).strip() if v else "" for k, v in data.items()}
-
-
-def build_row_data(parsed: dict) -> dict:
-    команда = parsed.get("name_team", "")
-    имя = parsed.get("name", "")
-    if имя:
-        команда = f"{команда}, {имя}"
-
-    заезд = f"{parsed.get('date_start', '')} {parsed.get('time_start', '')}".strip()
-    выезд = f"{parsed.get('date_end', '')} {parsed.get('time_end', '')}".strip()
-    отправление = f"{parsed.get('date_end', '')} {parsed.get('time_end', '')}".strip()
-
-    return {
-        "B":  команда,
-        "C":  заезд,
-        "D":  выезд,
-        "G":  parsed.get("kol_detey", ""),
-        "H":  parsed.get("kol_trener", ""),
-        "I":  parsed.get("kol_parent", ""),
-        "BN": parsed.get("transfer", ""),
-        "BQ": parsed.get("format_oplaty", ""),
-        "BT": parsed.get("info_pribytie", ""),
-        "BU": отправление,
-        "BV": parsed.get("name", ""),
-        "BW": parsed.get("phone", ""),
-        "BX": parsed.get("email", ""),
-    }
-
-
-@app.get("/")
-async def root():
-    return {"status": "ok", "message": "Tilda -> Google Sheets webhook работает"}
+def find_first_empty_row(ws: gspread.Worksheet) -> int:
+    col_a = ws.col_values(1)
+    for row_idx in range(FIRST_DATA_ROW, len(col_a) + 1):
+        if row_idx > len(col_a) or col_a[row_idx - 1] == "":
+            return row_idx
+    return len(col_a) + 1
 
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    # Всегда отвечаем 200 чтобы Тильда приняла вебхук
     try:
         content_type = request.headers.get("content-type", "")
         if "application/json" in content_type:
@@ -107,38 +55,70 @@ async def webhook(request: Request):
             form = await request.form()
             data = dict(form)
 
-        logger.info(f"Получена заявка: {data}")
-        parsed = parse_tilda_data(data)
+        logger.info("Received data: %s", data)
 
-        sheet_name = parsed.get("turnir", "").strip()
+        turnir = (data.get("turnir") or "").strip()
 
-        # Если поле turnir пустое — это тестовый запрос от Тильды, игнорируем
-        if not sheet_name:
-            logger.info("Поле turnir пустое — тестовый запрос, пропускаем")
-            return JSONResponse(content={"status": "ok", "info": "test request"}, status_code=200)
+        if not turnir:
+            logger.info("Empty turnir - ignoring test request")
+            return JSONResponse({"status": "ok", "ignored": True})
 
-        sheet = get_sheet(sheet_name)
-        next_row = find_next_empty_row(sheet)
-        logger.info(f"Записываем в лист '{sheet_name}', строка {next_row}")
+        name           = (data.get("name")            or "").strip()
+        phone          = (data.get("phone")           or "").strip()
+        email          = (data.get("email")           or "").strip()
+        name_team      = (data.get("name_team")       or "").strip()
+        format_oplaty  = (data.get("format_oplaty")   or "").strip()
+        date_start     = (data.get("date_start")      or "").strip()
+        time_start     = (data.get("time_start")      or "").strip()
+        info_pribytie  = (data.get("info_pribytie")   or "").strip()
+        date_end       = (data.get("date_end")        or "").strip()
+        time_end       = (data.get("time_end")        or "").strip()
+        kol_detey      = (data.get("kol_detey")       or "").strip()
+        kol_trener     = (data.get("kol_trener")      or "").strip()
+        kol_parent     = (data.get("kol_parent")      or "").strip()
+        transfer       = (data.get("transfer")        or "").strip()
 
-        sheet.update_cell(next_row, col_letter_to_index("A"), next_row - 4)
+        team_contact  = f"{name_team}, {name}" if name_team and name else (name_team or name)
+        arrival_dt    = f"{date_start} {time_start}".strip()
+        departure_dt  = f"{date_end} {time_end}".strip()
 
-        row_data = build_row_data(parsed)
-        for col_letter, value in row_data.items():
-            if value:
-                col_idx = col_letter_to_index(col_letter)
-                sheet.update_cell(next_row, col_idx, value)
+        ws = get_worksheet(turnir)
+        row = find_first_empty_row(ws)
+        serial = row - FIRST_DATA_ROW + 1
 
-        logger.info(f"Готово: лист '{sheet_name}', строка {next_row}")
-        return JSONResponse(
-            content={"status": "ok", "sheet": sheet_name, "row": next_row},
-            status_code=200
-        )
+        logger.info("Writing to sheet '%s', row %d", turnir, row)
 
-    except Exception as e:
-        # Даже при ошибке отвечаем 200 чтобы Тильда не блокировала вебхук
-        logger.error(f"Ошибка: {e}", exc_info=True)
-        return JSONResponse(
-            content={"status": "error", "detail": str(e)},
-            status_code=200
-        )
+        updates = [
+            {"range": f"A{row}",  "values": [[serial]]},
+            {"range": f"B{row}",  "values": [[team_contact]]},
+            {"range": f"C{row}",  "values": [[arrival_dt]]},
+            {"range": f"D{row}",  "values": [[departure_dt]]},
+            {"range": f"G{row}",  "values": [[kol_detey]]},
+            {"range": f"H{row}",  "values": [[kol_trener]]},
+            {"range": f"I{row}",  "values": [[kol_parent]]},
+            {"range": f"BN{row}", "values": [[transfer]]},
+            {"range": f"BQ{row}", "values": [[format_oplaty]]},
+            {"range": f"BT{row}", "values": [[info_pribytie]]},
+            {"range": f"BU{row}", "values": [[departure_dt]]},
+            {"range": f"BV{row}", "values": [[name]]},
+            {"range": f"BW{row}", "values": [[phone]]},
+            {"range": f"BX{row}", "values": [[email]]},
+        ]
+
+        ws.batch_update(updates, value_input_option="USER_ENTERED")
+
+        logger.info("Successfully written row %d to sheet '%s'", row, turnir)
+        return JSONResponse({"status": "ok", "sheet": turnir, "row": row})
+
+    except gspread.exceptions.WorksheetNotFound:
+        logger.error("Worksheet '%s' not found", turnir)
+        return JSONResponse({"status": "error", "detail": f"Worksheet '{turnir}' not found"})
+
+    except Exception as exc:
+        logger.exception("Unexpected error: %s", exc)
+        return JSONResponse({"status": "error", "detail": str(exc)})
+
+
+@app.get("/")
+def healthcheck():
+    return {"status": "running"}
