@@ -20,6 +20,31 @@ SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
 FIRST_DATA_ROW = 5
 app = FastAPI(title="Tilda to Google Sheets webhook")
 
+# Bus options: (capacity, cost_rub)
+BUSES = [
+    (18, 16750),
+    (20, 20500),
+    (25, 20250),
+    (35, 29250),
+    (49, 37500),
+    (58, 45000),
+]
+
+def calculate_transfer_cost(total_people: int) -> int:
+    """Return minimum total bus cost to seat all people using DP."""
+    if total_people <= 0:
+        return 0
+    INF = float("inf")
+    dp = [INF] * (total_people + 1)
+    dp[0] = 0
+    for n in range(1, total_people + 1):
+        for cap, cost in BUSES:
+            if cap >= n:
+                dp[n] = min(dp[n], cost)
+            elif n - cap >= 0 and dp[n - cap] < INF:
+                dp[n] = min(dp[n], dp[n - cap] + cost)
+    return dp[total_people] if dp[total_people] < INF else 0
+
 def get_worksheet(turnir: str) -> gspread.Worksheet:
     creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
     if creds_json:
@@ -62,6 +87,7 @@ async def webhook(request: Request):
         date_start     = (data.get("date_start")      or "").strip()
         time_start     = (data.get("time_start")      or "").strip()
         info_pribytie  = (data.get("info_pribytie")   or "").strip()
+        info_otpravlenye = (data.get("info_otpravlenye") or "").strip()
         date_end       = (data.get("date_end")        or "").strip()
         time_end       = (data.get("time_end")        or "").strip()
         kol_detey      = (data.get("kol_detey")       or "").strip()
@@ -71,6 +97,20 @@ async def webhook(request: Request):
         team_contact  = f"{name_team}, {name}" if name_team and name else (name_team or name)
         arrival_dt    = f"{date_start} {time_start}".strip()
         departure_dt  = f"{date_end} {time_end}".strip()
+        departure_info = " ".join(filter(None, [date_end, time_end, info_otpravlenye]))
+        # Transfer cost calculation
+        if transfer.lower().startswith("да"):
+            try:
+                total_people = (
+                    int(kol_detey or 0)
+                    + int(kol_trener or 0)
+                    + int(kol_parent or 0)
+                )
+            except ValueError:
+                total_people = 0
+            transfer_cost = calculate_transfer_cost(total_people)
+        else:
+            transfer_cost = 0
         ws = get_worksheet(turnir)
         row = find_first_empty_row(ws)
         serial = row - FIRST_DATA_ROW + 1
@@ -83,9 +123,9 @@ async def webhook(request: Request):
             {"range": f"G{row}",  "values": [[kol_detey]]},
             {"range": f"H{row}",  "values": [[kol_trener]]},
             {"range": f"I{row}",  "values": [[kol_parent]]},
-            {"range": f"BN{row}", "values": [[transfer]]},
+            {"range": f"BN{row}", "values": [[transfer_cost]]},
             {"range": f"BQ{row}", "values": [[format_oplaty]]},
-            {"range": f"BT{row}", "values": [[info_pribytie]]},
+            {"range": f"BT{row}", "values": [[departure_info]]},
             {"range": f"BU{row}", "values": [[departure_dt]]},
             {"range": f"BV{row}", "values": [[name]]},
             {"range": f"BW{row}", "values": [[phone]]},
