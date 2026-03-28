@@ -321,7 +321,7 @@ def upload_to_supabase(doc_bytes: bytes, filename: str) -> str:
     from supabase import create_client
     client = create_client(SUPABASE_URL, SUPABASE_KEY)
     # Make filename safe for storage path
-    safe_name = re.sub(r"[^\w\-]", "_", filename)
+    safe_name = re.sub(r"[^a-zA-Z0-9\-]", "_", filename)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = f"{ts}_{safe_name}.docx"
     client.storage.from_(SUPABASE_BUCKET).upload(
