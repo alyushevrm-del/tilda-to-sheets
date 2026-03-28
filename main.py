@@ -11,8 +11,6 @@ from fastapi.responses import JSONResponse
 
 import gspread
 from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
 
 from docx import Document
 from docx.oxml.ns import qn
@@ -28,7 +26,9 @@ SCOPES = [
 ]
 
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
-DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+SUPABASE_BUCKET = "documents"
 FIRST_DATA_ROW = 5
 SUMMARY_COL = "BY"
 LINK_COL = "BZ"
@@ -313,27 +313,23 @@ def fill_document(
     return buf.getvalue()
 
 
-def upload_to_drive(doc_bytes: bytes, filename: str) -> str:
-    """Upload document to Google Drive and return public download link."""
-    creds = get_creds()
-    service = build("drive", "v3", credentials=creds)
-
-    file_metadata = {"name": filename, "mimeType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"}
-    if DRIVE_FOLDER_ID:
-        file_metadata["parents"] = [DRIVE_FOLDER_ID]
-    media = MediaIoBaseUpload(io.BytesIO(doc_bytes), mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-
-    file = service.files().create(body=file_metadata, media_body=media, fields="id").execute()
-    file_id = file.get("id")
-
-    # Make public
-    service.permissions().create(
-        fileId=file_id,
-        body={"type": "anyone", "role": "reader"},
-    ).execute()
-
-    # Return direct download link
-    return f"https://drive.google.com/uc?export=download&id={file_id}"
+def upload_to_supabase(doc_bytes: bytes, filename: str) -> str:
+    """Upload document to Supabase Storage and return public download URL."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        logger.warning("Supabase credentials not set, skipping upload")
+        return ""
+    from supabase import create_client
+    client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    # Make filename safe for storage path
+    safe_name = re.sub(r"[^\w\-]", "_", filename)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = f"{ts}_{safe_name}.docx"
+    client.storage.from_(SUPABASE_BUCKET).upload(
+        path,
+        doc_bytes,
+        file_options={"content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
+    )
+    return client.storage.from_(SUPABASE_BUCKET).get_public_url(path)
 
 
 @app.post("/webhook")
@@ -409,7 +405,7 @@ async def webhook(request: Request):
                 spisok_vzrosly=spisok_vzrosly,
             )
             doc_name = f"Список «{name_team}, {turnir}»"
-            doc_link = upload_to_drive(doc_bytes, doc_name)
+            doc_link = upload_to_supabase(doc_bytes, doc_name)
         except Exception as doc_exc:
             logger.exception("Document generation/upload error: %s", doc_exc)
 
