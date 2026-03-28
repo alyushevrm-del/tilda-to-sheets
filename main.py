@@ -11,6 +11,10 @@ from fastapi.responses import JSONResponse
 
 import gspread
 from google.oauth2.service_account import Credentials
+from google.oauth2.credentials import Credentials as UserCredentials
+from google.auth.transport.requests import Request as GoogleRequest
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 
 from docx import Document
 from docx.oxml.ns import qn
@@ -26,9 +30,10 @@ SCOPES = [
 ]
 
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
-SUPABASE_BUCKET = "documents"
+DRIVE_CLIENT_ID     = os.environ.get("DRIVE_CLIENT_ID", "")
+DRIVE_CLIENT_SECRET = os.environ.get("DRIVE_CLIENT_SECRET", "")
+DRIVE_REFRESH_TOKEN = os.environ.get("DRIVE_REFRESH_TOKEN", "")
+DRIVE_FOLDER_ID     = os.environ.get("DRIVE_FOLDER_ID", "")
 FIRST_DATA_ROW = 5
 SUMMARY_COL = "BY"
 LINK_COL = "BZ"
@@ -313,39 +318,45 @@ def fill_document(
     return buf.getvalue()
 
 
-def upload_to_supabase(doc_bytes: bytes, filename: str) -> str:
-    """Upload document to private Supabase Storage and return a signed URL (valid 1 year)."""
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        logger.warning("Supabase credentials not set, skipping upload")
+def get_drive_user_creds() -> UserCredentials:
+    creds = UserCredentials(
+        token=None,
+        refresh_token=DRIVE_REFRESH_TOKEN,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=DRIVE_CLIENT_ID,
+        client_secret=DRIVE_CLIENT_SECRET,
+        scopes=["https://www.googleapis.com/auth/drive.file"],
+    )
+    creds.refresh(GoogleRequest())
+    return creds
+
+
+def upload_to_drive(doc_bytes: bytes, filename: str) -> str:
+    """Upload document to Google Drive using OAuth2 user credentials and return a view link."""
+    if not DRIVE_CLIENT_ID or not DRIVE_CLIENT_SECRET or not DRIVE_REFRESH_TOKEN:
+        logger.warning("Drive OAuth2 credentials not set, skipping upload")
         return ""
-    import requests as _req
-    safe_name = re.sub(r"[^a-zA-Z0-9\-]", "_", filename)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = f"{ts}_{safe_name}.docx"
-    auth = {"Authorization": f"Bearer {SUPABASE_KEY}"}
-    # Upload
-    up = _req.post(
-        f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{path}",
-        headers={**auth, "Content-Type": "application/octet-stream"},
-        data=doc_bytes,
-        timeout=30,
-    )
-    if up.status_code not in (200, 201):
-        raise Exception(f"Supabase upload {up.status_code}: {up.text}")
-    # Get signed URL (1 year = 31536000 sec)
-    sg = _req.post(
-        f"{SUPABASE_URL}/storage/v1/object/sign/{SUPABASE_BUCKET}/{path}",
-        headers={**auth, "Content-Type": "application/json"},
-        json={"expiresIn": 31536000},
-        timeout=10,
-    )
-    if sg.status_code not in (200, 201):
-        raise Exception(f"Supabase sign {sg.status_code}: {sg.text}")
-    data = sg.json()
-    signed_path = data.get("signedURL") or data.get("signedUrl") or data.get("signed_url") or ""
-    if signed_path and not signed_path.startswith("http"):
-        signed_path = f"{SUPABASE_URL}/storage/v1{signed_path}"
-    return signed_path
+    creds = get_drive_user_creds()
+    service = build("drive", "v3", credentials=creds)
+    mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    file_metadata: dict = {"name": filename, "mimeType": mime}
+    if DRIVE_FOLDER_ID:
+        file_metadata["parents"] = [DRIVE_FOLDER_ID]
+    media = MediaIoBaseUpload(io.BytesIO(doc_bytes), mimetype=mime, resumable=False)
+    file = service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields="id",
+    ).execute()
+    file_id = file.get("id")
+    if not file_id:
+        raise Exception("Drive upload returned no file ID")
+    # Make the file readable by anyone with the link
+    service.permissions().create(
+        fileId=file_id,
+        body={"type": "anyone", "role": "reader"},
+    ).execute()
+    return f"https://drive.google.com/file/d/{file_id}/view"
 
 
 @app.post("/webhook")
@@ -421,7 +432,7 @@ async def webhook(request: Request):
                 spisok_vzrosly=spisok_vzrosly,
             )
             doc_name = f"Список «{name_team}, {turnir}»"
-            doc_link = upload_to_supabase(doc_bytes, doc_name)
+            doc_link = upload_to_drive(doc_bytes, doc_name)
         except Exception as doc_exc:
             logger.exception("Document generation/upload error: %s", doc_exc)
 
