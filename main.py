@@ -28,6 +28,7 @@ SCOPES = [
 ]
 
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
+DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "")
 FIRST_DATA_ROW = 5
 SUMMARY_COL = "BY"
 LINK_COL = "BZ"
@@ -318,6 +319,8 @@ def upload_to_drive(doc_bytes: bytes, filename: str) -> str:
     service = build("drive", "v3", credentials=creds)
 
     file_metadata = {"name": filename, "mimeType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"}
+    if DRIVE_FOLDER_ID:
+        file_metadata["parents"] = [DRIVE_FOLDER_ID]
     media = MediaIoBaseUpload(io.BytesIO(doc_bytes), mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
     file = service.files().create(body=file_metadata, media_body=media, fields="id").execute()
