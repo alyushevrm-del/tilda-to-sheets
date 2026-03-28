@@ -314,7 +314,7 @@ def fill_document(
 
 
 def upload_to_supabase(doc_bytes: bytes, filename: str) -> str:
-    """Upload document to Supabase Storage and return public download URL."""
+    """Upload document to private Supabase Storage and return a signed URL (valid 1 year)."""
     if not SUPABASE_URL or not SUPABASE_KEY:
         logger.warning("Supabase credentials not set, skipping upload")
         return ""
@@ -329,7 +329,9 @@ def upload_to_supabase(doc_bytes: bytes, filename: str) -> str:
         doc_bytes,
         file_options={"content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
     )
-    return client.storage.from_(SUPABASE_BUCKET).get_public_url(path)
+    # Signed URL valid for 1 year (31536000 seconds) — private bucket, no public access
+    signed = client.storage.from_(SUPABASE_BUCKET).create_signed_url(path, 31536000)
+    return signed.get("signedURL") or signed.get("signed_url") or ""
 
 
 @app.post("/webhook")
