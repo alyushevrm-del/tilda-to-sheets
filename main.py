@@ -318,20 +318,34 @@ def upload_to_supabase(doc_bytes: bytes, filename: str) -> str:
     if not SUPABASE_URL or not SUPABASE_KEY:
         logger.warning("Supabase credentials not set, skipping upload")
         return ""
-    from supabase import create_client
-    client = create_client(SUPABASE_URL, SUPABASE_KEY)
-    # Make filename safe for storage path
+    import requests as _req
     safe_name = re.sub(r"[^a-zA-Z0-9\-]", "_", filename)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = f"{ts}_{safe_name}.docx"
-    client.storage.from_(SUPABASE_BUCKET).upload(
-        path,
-        doc_bytes,
-        file_options={"content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
+    auth = {"Authorization": f"Bearer {SUPABASE_KEY}"}
+    # Upload
+    up = _req.post(
+        f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{path}",
+        headers={**auth, "Content-Type": "application/octet-stream"},
+        data=doc_bytes,
+        timeout=30,
     )
-    # Signed URL valid for 1 year (31536000 seconds) — private bucket, no public access
-    signed = client.storage.from_(SUPABASE_BUCKET).create_signed_url(path, 31536000)
-    return signed.get("signedURL") or signed.get("signed_url") or ""
+    if up.status_code not in (200, 201):
+        raise Exception(f"Supabase upload {up.status_code}: {up.text}")
+    # Get signed URL (1 year = 31536000 sec)
+    sg = _req.post(
+        f"{SUPABASE_URL}/storage/v1/object/sign/{SUPABASE_BUCKET}/{path}",
+        headers={**auth, "Content-Type": "application/json"},
+        json={"expiresIn": 31536000},
+        timeout=10,
+    )
+    if sg.status_code not in (200, 201):
+        raise Exception(f"Supabase sign {sg.status_code}: {sg.text}")
+    data = sg.json()
+    signed_path = data.get("signedURL") or data.get("signedUrl") or data.get("signed_url") or ""
+    if signed_path and not signed_path.startswith("http"):
+        signed_path = f"{SUPABASE_URL}/storage/v1{signed_path}"
+    return signed_path
 
 
 @app.post("/webhook")
