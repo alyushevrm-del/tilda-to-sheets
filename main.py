@@ -9,12 +9,11 @@ from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+import urllib.request
+import urllib.error
+
 import gspread
 from google.oauth2.service_account import Credentials
-from google.oauth2.credentials import Credentials as UserCredentials
-from google.auth.transport.requests import Request as GoogleRequest
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
 
 from docx import Document
 from docx.oxml.ns import qn
@@ -30,10 +29,8 @@ SCOPES = [
 ]
 
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
-DRIVE_CLIENT_ID     = os.environ.get("DRIVE_CLIENT_ID", "")
-DRIVE_CLIENT_SECRET = os.environ.get("DRIVE_CLIENT_SECRET", "")
-DRIVE_REFRESH_TOKEN = os.environ.get("DRIVE_REFRESH_TOKEN", "")
-DRIVE_FOLDER_ID     = os.environ.get("DRIVE_FOLDER_ID", "")
+APPS_SCRIPT_URL = os.environ.get("APPS_SCRIPT_URL", "")
+DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "")
 FIRST_DATA_ROW = 5
 SUMMARY_COL = "BY"
 LINK_COL = "BZ"
@@ -217,7 +214,7 @@ def build_summary(
 
 
 def parse_person_list(text: str) -> list:
-    """Parse textarea person list into rows: each line → [fio, dob, phone]."""
+    """Parse textarea person list into rows: each line -> [fio, dob, phone]."""
     rows = []
     for line in (text or "").splitlines():
         line = line.strip()
@@ -260,13 +257,13 @@ def fill_document(
     # --- Paragraph 0: title + team + trainer ---
     para0 = doc.paragraphs[0]
     runs = para0.runs
-    # run[1] → tournament name
+    # run[1] -> tournament name
     if len(runs) > 1:
         runs[1].text = f"«{turnir}»"
-    # run[3] → team name (bold)
+    # run[3] -> team name (bold)
     if len(runs) > 3:
         runs[3].text = f"«{name_team}»"
-    # run[9] → trainer info
+    # run[9] -> trainer info
     if len(runs) > 9:
         runs[9].text = f"{name_zakazchik}, {phone}".strip(", ")
 
@@ -318,45 +315,27 @@ def fill_document(
     return buf.getvalue()
 
 
-def get_drive_user_creds() -> UserCredentials:
-    creds = UserCredentials(
-        token=None,
-        refresh_token=DRIVE_REFRESH_TOKEN,
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=DRIVE_CLIENT_ID,
-        client_secret=DRIVE_CLIENT_SECRET,
-        scopes=["https://www.googleapis.com/auth/drive.file"],
-    )
-    creds.refresh(GoogleRequest())
-    return creds
-
-
-def upload_to_drive(doc_bytes: bytes, filename: str) -> str:
-    """Upload document to Google Drive using OAuth2 user credentials and return a view link."""
-    if not DRIVE_CLIENT_ID or not DRIVE_CLIENT_SECRET or not DRIVE_REFRESH_TOKEN:
-        logger.warning("Drive OAuth2 credentials not set, skipping upload")
+def upload_via_apps_script(doc_bytes: bytes, filename: str) -> str:
+    """Upload document via Google Apps Script web app and return a Drive view link."""
+    if not APPS_SCRIPT_URL:
+        logger.warning("APPS_SCRIPT_URL not set, skipping upload")
         return ""
-    creds = get_drive_user_creds()
-    service = build("drive", "v3", credentials=creds)
-    mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    file_metadata: dict = {"name": filename, "mimeType": mime}
-    if DRIVE_FOLDER_ID:
-        file_metadata["parents"] = [DRIVE_FOLDER_ID]
-    media = MediaIoBaseUpload(io.BytesIO(doc_bytes), mimetype=mime, resumable=False)
-    file = service.files().create(
-        body=file_metadata,
-        media_body=media,
-        fields="id",
-    ).execute()
-    file_id = file.get("id")
-    if not file_id:
-        raise Exception("Drive upload returned no file ID")
-    # Make the file readable by anyone with the link
-    service.permissions().create(
-        fileId=file_id,
-        body={"type": "anyone", "role": "reader"},
-    ).execute()
-    return f"https://drive.google.com/file/d/{file_id}/view"
+    payload = json.dumps({
+        "fileData": base64.b64encode(doc_bytes).decode("utf-8"),
+        "fileName": filename,
+        "folderId": DRIVE_FOLDER_ID,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        APPS_SCRIPT_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        result = json.loads(resp.read().decode("utf-8"))
+    if not result.get("success"):
+        raise Exception(f"Apps Script error: {result.get('error')}")
+    return result["url"]
 
 
 @app.post("/webhook")
@@ -432,7 +411,7 @@ async def webhook(request: Request):
                 spisok_vzrosly=spisok_vzrosly,
             )
             doc_name = f"Список «{name_team}, {turnir}»"
-            doc_link = upload_to_drive(doc_bytes, doc_name)
+            doc_link = upload_via_apps_script(doc_bytes, doc_name)
         except Exception as doc_exc:
             logger.exception("Document generation/upload error: %s", doc_exc)
 
