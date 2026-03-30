@@ -214,20 +214,60 @@ def build_summary(
 
 
 def parse_person_list(text: str) -> list:
-    """Parse textarea person list into rows: each line -> [fio, dob, phone]."""
+    """Parse textarea person list into rows: [fio, dob, phone].
+
+    Expected format — 2 lines per person:
+      Line 1: FIO DD.MM.YYYY  (date may be DD.MM YYYY or attached without space)
+      Line 2: phone number
+    Also handles legacy comma-separated: FIO, DD.MM.YYYY, phone
+    """
+    date_re = re.compile(r'(\d{2}\.\d{2}[\. ]\d{4})\s*$')
+    phone_re = re.compile(r'^[\+\d][\d\s\-\(\)]{5,}$')
+
+    lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
     rows = []
-    for line in (text or "").splitlines():
-        line = line.strip()
-        if not line:
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # Legacy: comma-separated on one line
+        if ',' in line:
+            parts = [p.strip() for p in line.split(',')]
+            if len(parts) >= 3:
+                rows.append([parts[0], parts[1], parts[2]])
+            elif len(parts) == 2:
+                rows.append([parts[0], parts[1], ''])
+            else:
+                rows.append([line, '', ''])
+            i += 1
             continue
-        # Try to split on commas: FIO, DOB, phone
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) >= 3:
-            rows.append([parts[0], parts[1], parts[2]])
-        elif len(parts) == 2:
-            rows.append([parts[0], parts[1], ""])
+
+        # Skip orphan phone-only lines
+        if phone_re.match(line):
+            i += 1
+            continue
+
+        # Extract date from end of line
+        dm = date_re.search(line)
+        if dm:
+            raw_date = dm.group(1)
+            # Normalise: DD.MM YYYY -> DD.MM.YYYY
+            date_str = re.sub(r'(\d{2}\.\d{2}) (\d{4})', r'\1.\2', raw_date)
+            fio = line[:dm.start()].strip()
         else:
-            rows.append([line, "", ""])
+            date_str = ''
+            fio = line
+
+        # Next line: phone?
+        phone = ''
+        if i + 1 < len(lines) and phone_re.match(lines[i + 1]):
+            phone = lines[i + 1]
+            i += 2
+        else:
+            i += 1
+
+        rows.append([fio, date_str, phone])
+
     return rows
 
 
