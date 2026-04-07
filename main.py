@@ -1,217 +1,24 @@
-import os
+import base64
 import io
 import json
-import logging
+import os
 import re
-import base64
-from datetime import datetime, timedelta
+import tempfile
+from datetime import datetime
 
-from fastapi import FastAPI, Request
+import httpx
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
-import urllib.request
-import urllib.error
+from contracts import generate_all_contracts
 
-import gspread
-from google.oauth2.service_account import Credentials
+app = FastAPI()
 
-from docx import Document
-from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
-import copy
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
-
-SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
 APPS_SCRIPT_URL = os.environ.get("APPS_SCRIPT_URL", "")
-DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "")
-FIRST_DATA_ROW = 5
-SUMMARY_COL = "BY"
-LINK_COL = "BZ"
 
-app = FastAPI(title="Tilda to Google Sheets webhook")
-
-BUSES = [
-    (18, 16750),
-    (20, 20500),
-    (25, 20250),
-    (35, 29250),
-    (49, 37500),
-    (58, 45000),
-]
-
-MEAL_MAP = {
-    "завтрак": 0,
-    "обед": 1,
-    "полдник": 2,
-    "ужин": 3,
-    "второй ужин": 4,
-}
-STANDARD_MEAL_OFFSETS = [0, 1, 3]  # з, о, у
-
-TEMPLATE_B64 = os.environ["TEMPLATE_B64"]
-
-
-def calculate_transfer_cost(total_people: int) -> int:
-    if total_people <= 0:
-        return 0
-    INF = float("inf")
-    dp = [INF] * (total_people + 1)
-    dp[0] = 0
-    for n in range(1, total_people + 1):
-        for cap, cost in BUSES:
-            if cap >= n:
-                dp[n] = min(dp[n], cost)
-            elif n - cap >= 0 and dp[n - cap] < INF:
-                dp[n] = min(dp[n], dp[n - cap] + cost)
-    return dp[total_people] if dp[total_people] < INF else 0
-
-
-def normalize_phone(phone: str) -> str:
-    if phone.startswith("+7"):
-        return "8" + phone[2:]
-    return phone
-
-
-def col_num_to_letter(n: int) -> str:
-    result = ""
-    while n > 0:
-        n -= 1
-        result = chr(ord("A") + n % 26) + result
-        n //= 26
-    return result
-
-
-def parse_meal_offsets(meals_str: str) -> set:
-    offsets = set()
-    for m in re.split(r"[,;\n]", meals_str or ""):
-        m = m.strip().lower()
-        if m in MEAL_MAP:
-            offsets.add(MEAL_MAP[m])
-    return offsets
-
-
-def build_meal_updates(ws, date_start_str, date_end_str, pitanie_start, pitanie_end, total_people, row):
-    if not date_start_str or not date_end_str or total_people <= 0:
-        return []
-    try:
-        d_start = datetime.strptime(date_start_str.strip(), "%d.%m.%Y")
-        d_end = datetime.strptime(date_end_str.strip(), "%d.%m.%Y")
-    except ValueError:
-        return []
-    header3 = ws.row_values(3)
-    date_pattern = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
-    date_col_map = {}
-    for i, val in enumerate(header3):
-        val = str(val).strip()
-        if date_pattern.match(val):
-            date_col_map[val] = i + 1  # 1-indexed
-    if not date_col_map:
-        return []
-    meals_arrival = parse_meal_offsets(pitanie_start)
-    meals_departure = parse_meal_offsets(pitanie_end)
-    standard = set(STANDARD_MEAL_OFFSETS)
-    updates = []
-    current = d_start
-    while current <= d_end:
-        date_key = current.strftime("%d.%m.%Y")
-        if date_key in date_col_map:
-            base_col = date_col_map[date_key]
-            if current == d_start and current == d_end:
-                active = meals_arrival | meals_departure if (meals_arrival or meals_departure) else standard
-            elif current == d_start:
-                active = meals_arrival if meals_arrival else standard
-            elif current == d_end:
-                active = meals_departure if meals_departure else standard
-            else:
-                active = standard
-            for offset in sorted(active):
-                col_letter = col_num_to_letter(base_col + offset)
-                updates.append({"range": f"{col_letter}{row}", "values": [[total_people]]})
-        current += timedelta(days=1)
-    return updates
-
-
-def get_creds():
-    creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-    if creds_json:
-        info = json.loads(creds_json, strict=False)
-        return Credentials.from_service_account_info(info, scopes=SCOPES)
-    return Credentials.from_service_account_file("/etc/secrets/credentials.json", scopes=SCOPES)
-
-
-def get_worksheet(turnir: str) -> gspread.Worksheet:
-    creds = get_creds()
-    client = gspread.authorize(creds)
-    return client.open_by_key(SPREADSHEET_ID).worksheet(turnir)
-
-
-def find_first_empty_row(ws: gspread.Worksheet) -> int:
-    col_b = ws.col_values(2)
-    for row_idx in range(FIRST_DATA_ROW, len(col_b) + 2):
-        val = col_b[row_idx - 1] if row_idx - 1 < len(col_b) else ""
-        if val == "":
-            return row_idx
-    return max(len(col_b) + 1, FIRST_DATA_ROW)
-
-
-def meal_label(meals_str: str) -> str:
-    """Return comma-separated meal names from pitanie string."""
-    parts = []
-    for m in re.split(r"[,;\n]", meals_str or ""):
-        m = m.strip().lower()
-        if m in MEAL_MAP:
-            parts.append(m)
-    return ", ".join(parts)
-
-
-def build_summary(
-    name_team: str,
-    turnir: str,
-    name_zakazchik: str,
-    phone: str,
-    date_start: str,
-    time_start: str,
-    date_end: str,
-    time_end: str,
-    kol_detey: str,
-    kol_trener: str,
-    kol_parent: str,
-    pitanie_start: str,
-    pitanie_end: str,
-) -> str:
-    try:
-        n_sportsmen = int(kol_detey or 0) + int(kol_parent or 0)
-        n_trener = int(kol_trener or 0)
-    except ValueError:
-        n_sportsmen = 0
-        n_trener = 0
-
-    arrival = f"{date_start} {time_start}".strip()
-    departure = f"{date_end} {time_end}".strip()
-
-    meal_arrival_label = meal_label(pitanie_start)
-    meal_departure_label = meal_label(pitanie_end)
-
-    lines = [
-        f"{name_team}, {name_zakazchik} {phone}".strip(", "),
-        f"заезд {arrival}",
-        f"выезд {departure}",
-        f"{n_sportsmen} спортсменов, {n_trener} тренер",
-    ]
-    if meal_arrival_label:
-        lines.append(f"питание в день заезда {meal_arrival_label}")
-    if meal_departure_label:
-        lines.append(f"питание в день выезда {meal_departure_label}")
-
-    return "\n".join(lines)
-
+# ─────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────
 
 def parse_person_list(text: str) -> list:
     """Parse textarea person list into rows: [fio, dob, phone].
@@ -221,8 +28,8 @@ def parse_person_list(text: str) -> list:
       Line 2: phone number
     Also handles legacy comma-separated: FIO, DD.MM.YYYY, phone
     """
-    date_re = re.compile(r'(\d{2}\.\d{2}[\. ]\d{4})\s*$')
-    phone_re = re.compile(r'^[\+\d][\d\s\-\(\)]{5,}$')
+    date_re = re.compile(r"(\d{2}\.\d{2}[\. ]\d{4})\s*")
+    phone_re = re.compile(r"^[\+\d][\d\s\-\(\)]{5,}")
 
     lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
     rows = []
@@ -231,14 +38,14 @@ def parse_person_list(text: str) -> list:
         line = lines[i]
 
         # Legacy: comma-separated on one line
-        if ',' in line:
-            parts = [p.strip() for p in line.split(',')]
+        if "," in line:
+            parts = [p.strip() for p in line.split(",")]
             if len(parts) >= 3:
                 rows.append([parts[0], parts[1], parts[2]])
             elif len(parts) == 2:
-                rows.append([parts[0], parts[1], ''])
+                rows.append([parts[0], parts[1], ""])
             else:
-                rows.append([line, '', ''])
+                rows.append([line, "", ""])
             i += 1
             continue
 
@@ -252,14 +59,14 @@ def parse_person_list(text: str) -> list:
         if dm:
             raw_date = dm.group(1)
             # Normalise: DD.MM YYYY -> DD.MM.YYYY
-            date_str = re.sub(r'(\d{2}\.\d{2}) (\d{4})', r'\1.\2', raw_date)
-            fio = line[:dm.start()].strip()
+            date_str = re.sub(r"(\d{2}\.\d{2}) (\d{4})", r"\1.\2", raw_date)
+            fio = line[: dm.start()].strip()
         else:
-            date_str = ''
+            date_str = ""
             fio = line
 
         # Next line: phone?
-        phone = ''
+        phone = ""
         if i + 1 < len(lines) and phone_re.match(lines[i + 1]):
             phone = lines[i + 1]
             i += 2
@@ -271,223 +78,143 @@ def parse_person_list(text: str) -> list:
     return rows
 
 
-def set_cell_text(cell, text: str):
-    """Clear a table cell and set plain text."""
-    for para in cell.paragraphs:
-        for run in para.runs:
-            run.text = ""
-    if cell.paragraphs:
-        cell.paragraphs[0].add_run(text)
-    else:
-        cell.add_paragraph(text)
+async def upload_to_drive(
+    content_bytes: bytes,
+    filename: str,
+    folder_id: str = "",
+) -> str:
+    """Upload a file to Google Drive via Apps Script proxy. Returns shareable URL."""
+    b64 = base64.b64encode(content_bytes).decode()
+    payload = {
+        "action": "upload_file",
+        "filename": filename,
+        "content_base64": b64,
+        "folder_id": folder_id,
+    }
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(APPS_SCRIPT_URL, json=payload)
+    data = resp.json()
+    if data.get("status") != "ok":
+        raise RuntimeError(f"Drive upload failed: {data}")
+    return data.get("url", "")
 
 
-def fill_document(
-    turnir: str,
-    name_team: str,
-    name_zakazchik: str,
-    phone: str,
-    spisok_detey: str,
-    spisok_vzrosly: str,
-) -> bytes:
-    """Fill Word template and return bytes of the filled document."""
-    template_bytes = base64.b64decode(TEMPLATE_B64)
-    doc = Document(io.BytesIO(template_bytes))
-
-    # --- Paragraph 0: title + team + trainer ---
-    para0 = doc.paragraphs[0]
-    runs = para0.runs
-    # run[1] -> tournament name
-    if len(runs) > 1:
-        runs[1].text = f"«{turnir}»"
-    # run[3] -> team name (bold)
-    if len(runs) > 3:
-        runs[3].text = f"«{name_team}»"
-    # run[9] -> trainer info
-    if len(runs) > 9:
-        runs[9].text = f"{name_zakazchik}, {phone}".strip(", ")
-
-    # --- Table: fill athlete rows ---
-    if doc.tables:
-        table = doc.tables[0]
-        # Collect all people: athletes first, then adults
-        athletes = parse_person_list(spisok_detey)
-        adults = parse_person_list(spisok_vzrosly)
-        all_people = athletes + adults
-
-        # Data rows start at index 1 (row 0 is header)
-        data_rows = table.rows[1:]
-
-        for i, row in enumerate(data_rows):
-            cells = row.cells
-            if i < len(all_people):
-                person = all_people[i]
-                set_cell_text(cells[0], str(i + 1))    # №
-                set_cell_text(cells[1], person[0])      # ФИО
-                set_cell_text(cells[2], person[1])      # Дата рождения
-                set_cell_text(cells[3], person[2])      # Телефон
-                set_cell_text(cells[4], "")             # Посадочное место
-            else:
-                # Clear unused rows
-                for cell in cells:
-                    set_cell_text(cell, "")
-
-        # If we have more people than template rows, add new rows
-        if len(all_people) > len(data_rows):
-            template_data_row = data_rows[-1] if data_rows else None
-            for i in range(len(data_rows), len(all_people)):
-                person = all_people[i]
-                # Add new row by copying last data row's XML
-                if template_data_row is not None:
-                    new_tr = copy.deepcopy(template_data_row._tr)
-                    table._tbl.append(new_tr)
-                    # Access the newly appended row
-                    new_row = table.rows[-1]
-                    cells = new_row.cells
-                    set_cell_text(cells[0], str(i + 1))
-                    set_cell_text(cells[1], person[0])
-                    set_cell_text(cells[2], person[1])
-                    set_cell_text(cells[3], person[2])
-                    set_cell_text(cells[4], "")
-
-    buf = io.BytesIO()
-    doc.save(buf)
-    return buf.getvalue()
-
-
-def upload_via_apps_script(doc_bytes: bytes, filename: str) -> str:
-    """Upload document via Google Apps Script web app and return a Drive view link."""
-    if not APPS_SCRIPT_URL:
-        logger.warning("APPS_SCRIPT_URL not set, skipping upload")
-        return ""
-    payload = json.dumps({
-        "fileData": base64.b64encode(doc_bytes).decode("utf-8"),
-        "fileName": filename,
-        "folderId": DRIVE_FOLDER_ID,
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        APPS_SCRIPT_URL,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        result = json.loads(resp.read().decode("utf-8"))
-    if not result.get("success"):
-        raise Exception(f"Apps Script error: {result.get('error')}")
-    return result["url"]
-
+# ─────────────────────────────────────────────
+# Existing webhook — Tilda form → Google Sheets
+# ─────────────────────────────────────────────
 
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
-        content_type = request.headers.get("content-type", "")
-        if "application/json" in content_type:
-            data = await request.json()
-        else:
-            form = await request.form()
-            data = dict(form)
-        turnir = (data.get("turnir") or "").strip()
-        if not turnir:
-            return JSONResponse({"status": "ok", "ignored": True})
-        name             = (data.get("name")             or "").strip()
-        phone            = normalize_phone((data.get("phone") or "").strip())
-        email            = (data.get("email")            or "").strip()
-        name_team        = (data.get("name_team")        or "").strip()
-        name_zakazchik   = (data.get("name_zakazchik")   or "").strip()
-        format_oplaty    = (data.get("format_oplaty")    or "").strip()
-        date_start       = (data.get("date_start")       or "").strip()
-        time_start       = (data.get("time_start")       or "").strip()
-        info_pribytie    = (data.get("info_pribytie")    or "").strip()
-        info_otpravlenye = (data.get("info_otpravlenye") or "").strip()
-        date_end         = (data.get("date_end")         or "").strip()
-        time_end         = (data.get("time_end")         or "").strip()
-        kol_detey        = (data.get("kol_detey")        or "").strip()
-        kol_trener       = (data.get("kol_trener")       or "").strip()
-        kol_parent       = (data.get("kol_parent")       or "").strip()
-        transfer         = (data.get("transfer")         or "").strip()
-        pitanie_start    = (data.get("pitanie_start")    or "").strip()
-        pitanie_end      = (data.get("pitanie_end")      or "").strip()
-        pitanie_syh_end  = (data.get("pitanie_syh_end")  or "").strip()
-        spisok_detey     = (data.get("spisok_detey")     or "").strip()
-        spisok_vzrosly   = (data.get("spisok_vzrosly")   or "").strip()
-
-        team_contact   = f"{name_team}, {name}" if name_team and name else (name_team or name)
-        arrival_dt     = f"{date_start} {time_start}".strip()
-        departure_dt   = f"{date_end} {time_end}".strip()
+        body = await request.body()
         try:
-            total_people = int(kol_detey or 0) + int(kol_trener or 0) + int(kol_parent or 0)
-        except ValueError:
-            total_people = 0
-        transfer_cost = calculate_transfer_cost(total_people) if transfer.lower().startswith("да") else 0
-        suh_paek_val = "да" if pitanie_syh_end.lower().startswith("да") else ("нет" if pitanie_syh_end else "")
+            data = json.loads(body)
+        except Exception:
+            from urllib.parse import parse_qs
+            parsed = parse_qs(body.decode("utf-8", errors="replace"))
+            data = {k: v[0] for k, v in parsed.items()}
 
-        # Build summary text
-        summary = build_summary(
-            name_team=name_team,
-            turnir=turnir,
-            name_zakazchik=name_zakazchik or name,
-            phone=phone,
-            date_start=date_start,
-            time_start=time_start,
-            date_end=date_end,
-            time_end=time_end,
-            kol_detey=kol_detey,
-            kol_trener=kol_trener,
-            kol_parent=kol_parent,
-            pitanie_start=pitanie_start,
-            pitanie_end=pitanie_end,
-        )
-
-        # Generate and upload document
-        doc_link = ""
-        try:
-            doc_bytes = fill_document(
-                turnir=turnir,
-                name_team=name_team,
-                name_zakazchik=name_zakazchik or name,
-                phone=phone,
-                spisok_detey=spisok_detey,
-                spisok_vzrosly=spisok_vzrosly,
+        # Pass the full payload to Apps Script for Sheets processing
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                APPS_SCRIPT_URL,
+                json={"action": "tilda_webhook", "data": data},
             )
-            doc_name = f"Список «{name_team}, {turnir}»"
-            doc_link = upload_via_apps_script(doc_bytes, doc_name)
-        except Exception as doc_exc:
-            logger.exception("Document generation/upload error: %s", doc_exc)
+        return JSONResponse({"status": "ok"})
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
-        ws  = get_worksheet(turnir)
-        row = find_first_empty_row(ws)
-        serial = row - FIRST_DATA_ROW + 1
-        updates = [
-            {"range": f"A{row}",        "values": [[serial]]},
-            {"range": f"B{row}",        "values": [[team_contact]]},
-            {"range": f"C{row}",        "values": [[arrival_dt]]},
-            {"range": f"D{row}",        "values": [[departure_dt]]},
-            {"range": f"G{row}",        "values": [[kol_detey]]},
-            {"range": f"H{row}",        "values": [[kol_trener]]},
-            {"range": f"I{row}",        "values": [[kol_parent]]},
-            {"range": f"BL{row}",       "values": [[suh_paek_val]]},
-            {"range": f"BN{row}",       "values": [[transfer_cost]]},
-            {"range": f"BQ{row}",       "values": [[format_oplaty]]},
-            {"range": f"BT{row}",       "values": [[info_pribytie]]},
-            {"range": f"BU{row}",       "values": [[info_otpravlenye]]},
-            {"range": f"BV{row}",       "values": [[name]]},
-            {"range": f"BW{row}",       "values": [[phone]]},
-            {"range": f"BX{row}",       "values": [[email]]},
-            {"range": f"{SUMMARY_COL}{row}", "values": [[summary]]},
-            {"range": f"{LINK_COL}{row}",    "values": [[doc_link]]},
-        ]
-        meal_updates = build_meal_updates(ws, date_start, date_end, pitanie_start, pitanie_end, total_people, row)
-        updates.extend(meal_updates)
-        ws.batch_update(updates, value_input_option="USER_ENTERED")
-        return JSONResponse({"status": "ok", "sheet": turnir, "row": row})
-    except gspread.exceptions.WorksheetNotFound:
-        return JSONResponse({"status": "error", "detail": f"Worksheet '{turnir}' not found"})
-    except Exception as exc:
-        logger.exception("Unexpected error: %s", exc)
-        return JSONResponse({"status": "error", "detail": str(exc)})
+
+# ─────────────────────────────────────────────
+# New endpoint — generate contracts
+# ─────────────────────────────────────────────
+
+@app.post("/generate-contracts")
+async def generate_contracts(request: Request):
+    """
+    Called by Google Apps Script checkbox trigger.
+
+    Expected JSON payload:
+    {
+      "team": "ГАУ ДО СО СШОР №1, Киселев Дмитрий Владимирович",
+      "arrival": "10.04.2026 9:00:00",
+      "departure": "12.04.2026 14:00:00",
+      "nights_accommodation": 2.0,
+      "nights_food": 2.0,
+      "children": 14,
+      "coaches": 1,
+      "parents": 2,
+      "price_food": 1200,
+      "price_accommodation": 1950,
+      "cost_food": 50150,
+      "cost_accommodation": 66300,
+      "cost_transfer": 16750,
+      "arrival_transport": "09.04.2026 22:43 ж/д вокзал Самара, поезд 147",
+      "departure_transport": "12.04.2026 ж/д вокзал Самара",
+      "contact_person": "Киселев Дмитрий Владимирович",
+      "phone": "8 (922) 106-58-83",
+      "email": "dmitrii-loskov@mail.ru",
+      "tournament_name": "Стремление Д2013-2014",
+      "folder_id": "optional_drive_folder_id",
+      "meal_schedule": {
+        "10.04.2026": ["обед", "ужин"],
+        "12.04.2026": ["завтрак", "обед"]
+      }
+    }
+
+    Returns:
+    {
+      "status": "ok",
+      "links": {
+        "transport_contract": "https://drive.google.com/...",
+        "transport_appendix": "https://drive.google.com/...",
+        "food_contract": "https://drive.google.com/...",
+        "food_appendix": "https://drive.google.com/...",
+        "accommodation_contract": "https://drive.google.com/..."
+      }
+    }
+    """
+    try:
+        payload = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
+
+    try:
+        docs = generate_all_contracts(payload)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Generation error: {e}")
+
+    folder_id = payload.get("folder_id", "")
+    team_short = (
+        payload.get("contact_person", "Команда")
+        .split()[-1]  # last name only for filename
+    )
+
+    file_map = {
+        "transport_contract":    (f"Договор_перевозки_{team_short}.docx",    "transport_contract"),
+        "transport_appendix":    (f"Приложение_перевозка_{team_short}.xlsx",  "transport_appendix"),
+        "food_contract":         (f"Договор_питания_{team_short}.docx",       "food_contract"),
+        "food_appendix":         (f"Приложение_питание_{team_short}.xlsx",    "food_appendix"),
+        "accommodation_contract": (f"Договор_проживания_{team_short}.docx",   "accommodation_contract"),
+    }
+
+    links = {}
+    errors = []
+    for key, (filename, doc_key) in file_map.items():
+        try:
+            url = await upload_to_drive(docs[doc_key], filename, folder_id)
+            links[key] = url
+        except Exception as e:
+            errors.append(f"{key}: {e}")
+            links[key] = ""
+
+    if errors:
+        return JSONResponse(
+            {"status": "partial", "links": links, "errors": errors}
+        )
+    return JSONResponse({"status": "ok", "links": links})
 
 
 @app.get("/")
-def healthcheck():
-    return {"status": "running"}
+async def health():
+    return {"status": "ok"}
